@@ -28,6 +28,10 @@ const SUGGESTIONS = [
 
 const STORAGE_KEY = "weather-agent-conversations";
 
+const API_BASE = (
+  import.meta.env.VITE_API_URL ?? "https://agent-desk.onrender.com"
+).replace(/\/$/, "");
+
 type StoredChatState = {
   conversations: Conversation[];
   activeId: string;
@@ -231,7 +235,7 @@ function ChatPage() {
     setLoading(true);
 
     try {
-      const res = await fetch("http://localhost:8000/chat", {
+      const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
