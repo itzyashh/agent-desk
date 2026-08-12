@@ -10,6 +10,15 @@ type Message = { role: "user" | "assistant"; content: string };
 type ChatApiResponse = {
   reply: string;
   conversation_name?: string | null;
+  needs_location?: boolean;
+};
+
+type ChatRequestBody = {
+  message: string;
+  thread_id: string;
+  new?: boolean;
+  latitude?: number;
+  longitude?: number;
 };
 
 type Conversation = {
@@ -73,6 +82,37 @@ function createConversation(title = "New chat"): Conversation {
     messages: [],
     updatedAt: Date.now(),
   };
+}
+
+async function postChat(body: ChatRequestBody): Promise<ChatApiResponse> {
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) throw new Error("Request failed");
+  return (await res.json()) as ChatApiResponse;
+}
+
+function requestBrowserLocation(): Promise<{ latitude: number; longitude: number }> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("Geolocation is not supported"));
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        resolve({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+      },
+      (error) => reject(error),
+      { enableHighAccuracy: false, timeout: 15000, maximumAge: 60_000 },
+    );
+  });
 }
 
 function StreamingTitle({
@@ -226,9 +266,11 @@ function ChatPage() {
 
     setInput("");
 
+    const conversationId = activeConversation.id;
+    const threadId = activeConversation.threadId;
     const isFirstMessage = activeConversation.messages.length === 0;
 
-    updateConversation(activeConversation.id, (c) => ({
+    updateConversation(conversationId, (c) => ({
       ...c,
       updatedAt: Date.now(),
       messages: [...c.messages, { role: "user", content: userMessage }],
@@ -237,19 +279,56 @@ function ChatPage() {
     setLoading(true);
 
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: userMessage,
-          thread_id: activeConversation.threadId,
-          new: isFirstMessage,
-        }),
+      let data = await postChat({
+        message: userMessage,
+        thread_id: threadId,
+        new: isFirstMessage,
       });
 
-      if (!res.ok) throw new Error("Request failed");
+      if (data.needs_location) {
+        try {
+          const coords = await requestBrowserLocation();
+          data = await postChat({
+            message:
+              "User shared current coordinates. Continue with the previous request.",
+            thread_id: threadId,
+            new: false,
+            latitude: coords.latitude,
+            longitude: coords.longitude,
+          });
+        } catch {
+          updateConversation(conversationId, (c) => ({
+            ...c,
+            updatedAt: Date.now(),
+            messages: [
+              ...c.messages,
+              {
+                role: "assistant",
+                content:
+                  "Location access is required for this. Please allow location permission and try again.",
+              },
+            ],
+          }));
+          return;
+        }
+      }
 
-      const data = (await res.json()) as ChatApiResponse;
+      if (data.needs_location) {
+        updateConversation(conversationId, (c) => ({
+          ...c,
+          updatedAt: Date.now(),
+          messages: [
+            ...c.messages,
+            {
+              role: "assistant",
+              content:
+                "Location access is required for this. Please allow location permission and try again.",
+            },
+          ],
+        }));
+        return;
+      }
+
       const fallbackTitle =
         userMessage.slice(0, 36) + (userMessage.length > 36 ? "…" : "");
       const newTitle =
@@ -257,17 +336,17 @@ function ChatPage() {
         (isFirstMessage ? fallbackTitle : activeConversation.title);
 
       if (isFirstMessage && newTitle !== activeConversation.title) {
-        setAnimatingTitleIds((prev) => new Set(prev).add(activeConversation.id));
+        setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
       }
 
-      updateConversation(activeConversation.id, (c) => ({
+      updateConversation(conversationId, (c) => ({
         ...c,
         title: newTitle,
         updatedAt: Date.now(),
         messages: [...c.messages, { role: "assistant", content: data.reply }],
       }));
     } catch {
-      updateConversation(activeConversation.id, (c) => ({
+      updateConversation(conversationId, (c) => ({
         ...c,
         updatedAt: Date.now(),
         messages: [
