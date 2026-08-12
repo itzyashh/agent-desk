@@ -1,15 +1,17 @@
 from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from langgraph.checkpoint.postgres import PostgresSaver
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from agent import (
+    build_location_tool_messages,
     clear_request_location,
     create_llm_agent,
     create_title_model,
     location_required_in_messages,
+    pending_tool_call_ids,
     set_request_location,
 )
 from swagger_theme_toggle import add_dark_mode_toggle
@@ -80,14 +82,39 @@ def root():
     return {"status": "ok", "message": "Agent Desk API is running"}
 
 
+def _repair_pending_location_calls(
+    config: dict,
+    latitude: float | None,
+    longitude: float | None,
+) -> None:
+    """Resolve dangling tool_calls left from a previous needs_location turn."""
+    if latitude is None or longitude is None:
+        return
+
+    state = agent.get_state(config)
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages") or []
+    pending = pending_tool_call_ids(messages)
+    if not pending:
+        return
+
+    tool_messages = build_location_tool_messages(pending, latitude, longitude)
+    agent.update_state(config, {"messages": tool_messages})
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(body: ChatRequest):
+    config = {"configurable": {"thread_id": body.thread_id}}
     set_request_location(body.latitude, body.longitude)
+
     try:
+        _repair_pending_location_calls(config, body.latitude, body.longitude)
         response = agent.invoke(
             {"messages": [{"role": "user", "content": body.message}]},
-            {"configurable": {"thread_id": body.thread_id}},
+            config,
         )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         clear_request_location()
 
