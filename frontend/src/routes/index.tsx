@@ -134,7 +134,7 @@ function ChatPage() {
   const [animatingTitleIds, setAnimatingTitleIds] = useState<Set<string>>(
     () => new Set(),
   );
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -160,7 +160,9 @@ function ChatPage() {
   const messages = activeConversation?.messages ?? [];
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
   }, [messages, loading, activeId]);
 
   useEffect(() => {
@@ -373,7 +375,7 @@ function ChatPage() {
             </span>
           </header>
 
-          <div className="chat-messages">
+          <div className="chat-messages" ref={messagesContainerRef}>
             {isEmpty ? (
               <div className="chat-empty">
                 <div className="chat-empty-icon">W</div>
@@ -422,7 +424,6 @@ function ChatPage() {
                 )}
               </>
             )}
-            <div ref={messagesEndRef} />
           </div>
 
           <div className="chat-input-area">
