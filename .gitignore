@@ -1,9 +1,28 @@
-Intro_AI/.env
-.venv/
+# OS
+.DS_Store
 
-# Python bytecode
+# Secrets
+.env
+**/.env
+
+# Python
+.venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
 *.pyc
+*.db
+
+# Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.nitro
+.tanstack
+.wrangler
+.output
+.vinxi
+__unconfig*
+todos.json

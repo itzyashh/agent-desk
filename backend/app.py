@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
         yield
 
 app = FastAPI(
-    title="LLM Agent API",
+    title="Agent Desk API",
     lifespan=lifespan,
     swagger_ui_parameters={
         "syntaxHighlight.theme": "obsidian"
@@ -54,7 +54,7 @@ class ChatResponse(BaseModel):
     
 @app.get('/')
 def root():
-    return {"status": "ok", "message": "LLM Agent API is running"}
+    return {"status": "ok", "message": "Agent Desk API is running"}
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(body: ChatRequest):

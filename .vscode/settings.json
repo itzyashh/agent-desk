@@ -1,4 +1,4 @@
 {
-    "python.defaultInterpreterPath": "${workspaceFolder}/Intro_AI/.venv/bin/python",
+    "python.defaultInterpreterPath": "${workspaceFolder}/backend/.venv/bin/python",
     "python.terminal.executeInFileDir": true
 }

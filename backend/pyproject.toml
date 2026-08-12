@@ -1,7 +1,7 @@
 [project]
-name = "intro-ai"
+name = "agent-desk"
 version = "0.1.0"
-description = "General-purpose LLM agent API"
+description = "Agent Desk — LLM agent API and chat workspace"
 readme = "README.md"
 authors = [
     { name = "Yash Jadhav", email = "yashjadhav1411@rocketmail.com" }
@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-intro-ai = "intro_ai:main"
+agent-desk = "intro_ai:main"
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]

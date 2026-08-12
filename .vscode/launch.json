@@ -2,13 +2,13 @@
     "version": "0.2.0",
     "configurations": [
       {
-        "name": "Debug Intro_AI main.py",
+        "name": "Debug Agent Desk backend",
         "type": "debugpy",
         "request": "launch",
-        "program": "${workspaceFolder}/Intro_AI/main.py",
+        "program": "${workspaceFolder}/backend/main.py",
         "console": "integratedTerminal",
-        "cwd": "${workspaceFolder}/Intro_AI",
-        "python": "${workspaceFolder}/Intro_AI/.venv/bin/python"
+        "cwd": "${workspaceFolder}/backend",
+        "python": "${workspaceFolder}/backend/.venv/bin/python"
       }
     ]
   }
