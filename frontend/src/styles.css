@@ -328,9 +328,14 @@ body {
   transition: background 0.15s, border-color 0.15s;
 }
 
-.chat-suggestion:hover {
+.chat-suggestion:hover:not(:disabled) {
   background: #252525;
   border-color: #484848;
+}
+
+.chat-suggestion:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .message {
@@ -478,6 +483,10 @@ body {
   margin-top: 0.625rem;
   font-size: 0.75rem;
   color: #6b6b6b;
+}
+
+.chat-footer-note-warn {
+  color: #c4a484;
 }
 
 @keyframes fadeIn {

@@ -11,6 +11,15 @@ type ChatApiResponse = {
   reply: string;
   conversation_name?: string | null;
   needs_location?: boolean;
+  tokens_used?: number | null;
+  tokens_remaining?: number | null;
+  daily_token_budget?: number | null;
+};
+
+type QuotaInfo = {
+  tokensUsed: number;
+  tokensRemaining: number;
+  dailyTokenBudget: number;
 };
 
 type ChatRequestBody = {
@@ -20,6 +29,18 @@ type ChatRequestBody = {
   latitude?: number;
   longitude?: number;
 };
+
+class ChatApiError extends Error {
+  status: number;
+  quota?: QuotaInfo;
+
+  constructor(message: string, status: number, quota?: QuotaInfo) {
+    super(message);
+    this.name = "ChatApiError";
+    this.status = status;
+    this.quota = quota;
+  }
+}
 
 type Conversation = {
   id: string;
@@ -36,6 +57,7 @@ const SUGGESTIONS = [
 ];
 
 const STORAGE_KEY = "agent-suite-conversations";
+const DEVICE_ID_KEY = "agent-suite-device-id";
 const APP_NAME = "Agent Suite";
 const ASSISTANT_NAME = "Agent";
 const ASSISTANT_AVATAR = "A";
@@ -43,6 +65,41 @@ const ASSISTANT_AVATAR = "A";
 const API_BASE = (
   import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 ).replace(/\/$/, "");
+
+function getOrCreateDeviceId(): string {
+  if (typeof window === "undefined") return crypto.randomUUID();
+
+  const existing = localStorage.getItem(DEVICE_ID_KEY);
+  if (existing) return existing;
+
+  const id = crypto.randomUUID();
+  localStorage.setItem(DEVICE_ID_KEY, id);
+  return id;
+}
+
+function quotaFromPayload(payload: unknown): QuotaInfo | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const data = payload as Record<string, unknown>;
+  const tokensUsed = data.tokens_used;
+  const tokensRemaining = data.tokens_remaining;
+  const dailyTokenBudget = data.daily_token_budget;
+  if (
+    typeof tokensUsed !== "number" ||
+    typeof tokensRemaining !== "number" ||
+    typeof dailyTokenBudget !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    tokensUsed,
+    tokensRemaining,
+    dailyTokenBudget,
+  };
+}
+
+function formatTokenCount(n: number): string {
+  return n.toLocaleString();
+}
 
 type StoredChatState = {
   conversations: Conversation[];
@@ -90,12 +147,33 @@ function createConversation(title = "New chat"): Conversation {
 async function postChat(body: ChatRequestBody): Promise<ChatApiResponse> {
   const res = await fetch(`${API_BASE}/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Device-Id": getOrCreateDeviceId(),
+    },
     body: JSON.stringify(body),
   });
 
-  if (!res.ok) throw new Error("Request failed");
-  return (await res.json()) as ChatApiResponse;
+  const payload = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    const detail =
+      payload && typeof payload === "object"
+        ? (payload as { detail?: unknown }).detail
+        : undefined;
+    const detailObj =
+      detail && typeof detail === "object"
+        ? (detail as Record<string, unknown>)
+        : null;
+    const message =
+      (typeof detailObj?.message === "string" && detailObj.message) ||
+      (typeof detail === "string" && detail) ||
+      "Request failed";
+    const quota = quotaFromPayload(detailObj ?? payload);
+    throw new ChatApiError(message, res.status, quota);
+  }
+
+  return payload as ChatApiResponse;
 }
 
 function requestBrowserLocation(): Promise<{ latitude: number; longitude: number }> {
@@ -174,11 +252,17 @@ function ChatPage() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [quota, setQuota] = useState<QuotaInfo | null>(null);
   const [animatingTitleIds, setAnimatingTitleIds] = useState<Set<string>>(
     () => new Set(),
   );
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  function applyQuotaFromResponse(data: ChatApiResponse) {
+    const next = quotaFromPayload(data);
+    if (next) setQuota(next);
+  }
 
   useEffect(() => {
     const stored = loadStoredState();
@@ -266,6 +350,7 @@ function ChatPage() {
   async function sendMessage(text: string) {
     const userMessage = text.trim();
     if (!userMessage || loading || !activeConversation) return;
+    if (quota && quota.tokensRemaining <= 0) return;
 
     setInput("");
 
@@ -287,6 +372,7 @@ function ChatPage() {
         thread_id: threadId,
         new: isFirstMessage,
       });
+      applyQuotaFromResponse(data);
 
       if (data.needs_location) {
         try {
@@ -299,7 +385,25 @@ function ChatPage() {
             latitude: coords.latitude,
             longitude: coords.longitude,
           });
-        } catch {
+          applyQuotaFromResponse(data);
+        } catch (error) {
+          if (error instanceof ChatApiError && error.status === 429) {
+            if (error.quota) setQuota(error.quota);
+            updateConversation(conversationId, (c) => ({
+              ...c,
+              updatedAt: Date.now(),
+              messages: [
+                ...c.messages,
+                {
+                  role: "assistant",
+                  content:
+                    error.message ||
+                    "Daily token budget reached. Try again tomorrow.",
+                },
+              ],
+            }));
+            return;
+          }
           updateConversation(conversationId, (c) => ({
             ...c,
             updatedAt: Date.now(),
@@ -348,19 +452,39 @@ function ChatPage() {
         updatedAt: Date.now(),
         messages: [...c.messages, { role: "assistant", content: data.reply }],
       }));
-    } catch {
-      updateConversation(conversationId, (c) => ({
-        ...c,
-        updatedAt: Date.now(),
-        messages: [
-          ...c.messages,
-          {
-            role: "assistant",
-            content:
-              "Something went wrong. Make sure the backend is running on port 8000.",
-          },
-        ],
-      }));
+    } catch (error) {
+      if (error instanceof ChatApiError) {
+        if (error.quota) setQuota(error.quota);
+        updateConversation(conversationId, (c) => ({
+          ...c,
+          updatedAt: Date.now(),
+          messages: [
+            ...c.messages,
+            {
+              role: "assistant",
+              content:
+                error.status === 429
+                  ? error.message ||
+                    "Daily token budget reached. Try again tomorrow."
+                  : error.message ||
+                    "Something went wrong. Please try again.",
+            },
+          ],
+        }));
+      } else {
+        updateConversation(conversationId, (c) => ({
+          ...c,
+          updatedAt: Date.now(),
+          messages: [
+            ...c.messages,
+            {
+              role: "assistant",
+              content:
+                "Something went wrong. Make sure the backend is running on port 8000.",
+            },
+          ],
+        }));
+      }
     } finally {
       setLoading(false);
     }
@@ -382,6 +506,8 @@ function ChatPage() {
     (a, b) => b.updatedAt - a.updatedAt,
   );
   const isEmpty = messages.length === 0 && !loading;
+  const quotaExhausted = Boolean(quota && quota.tokensRemaining <= 0);
+  const inputDisabled = loading || quotaExhausted;
 
   if (!ready) {
     return null;
@@ -470,6 +596,7 @@ function ChatPage() {
                       type="button"
                       className="chat-suggestion"
                       onClick={() => sendMessage(suggestion)}
+                      disabled={inputDisabled}
                     >
                       {suggestion}
                     </button>
@@ -517,14 +644,18 @@ function ChatPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={`Message ${APP_NAME}...`}
+                  placeholder={
+                    quotaExhausted
+                      ? "Daily token limit reached"
+                      : `Message ${APP_NAME}...`
+                  }
                   rows={1}
-                  disabled={loading}
+                  disabled={inputDisabled}
                 />
                 <button
                   type="submit"
                   className="chat-send"
-                  disabled={loading || !input.trim()}
+                  disabled={inputDisabled || !input.trim()}
                   aria-label="Send message"
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -540,8 +671,14 @@ function ChatPage() {
                 </button>
               </div>
             </form>
-            <p className="chat-footer-note">
-              {APP_NAME} can make mistakes. Check important info.
+            <p
+              className={`chat-footer-note${quotaExhausted ? " chat-footer-note-warn" : ""}`}
+            >
+              {quotaExhausted
+                ? `Daily limit reached (${formatTokenCount(quota!.dailyTokenBudget)} tokens). Resets at UTC midnight.`
+                : quota
+                  ? `${formatTokenCount(quota.tokensRemaining)} / ${formatTokenCount(quota.dailyTokenBudget)} tokens left today · ${APP_NAME} can make mistakes.`
+                  : `${APP_NAME} can make mistakes. Check important info.`}
             </p>
           </div>
         </div>
