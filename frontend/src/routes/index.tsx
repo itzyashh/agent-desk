@@ -30,12 +30,15 @@ type Conversation = {
 };
 
 const SUGGESTIONS = [
+  "What can you help me with?",
   "How is the weather today?",
-  "What's the weather in Mumbai?",
   "Where am I located?",
 ];
 
-const STORAGE_KEY = "weather-agent-conversations";
+const STORAGE_KEY = "agent-suite-conversations";
+const APP_NAME = "Agent Suite";
+const ASSISTANT_NAME = "Agent";
+const ASSISTANT_AVATAR = "A";
 
 const API_BASE = (
   import.meta.env.VITE_API_URL ?? "http://localhost:8000"
@@ -448,18 +451,18 @@ function ChatPage() {
             >
               ☰
             </button>
-            <div className="chat-header-icon">W</div>
+            <div className="chat-header-icon">{ASSISTANT_AVATAR}</div>
             <span className="chat-header-title">
-              {activeConversation?.title ?? "Weather Agent"}
+              {activeConversation?.title ?? APP_NAME}
             </span>
           </header>
 
           <div className="chat-messages" ref={messagesContainerRef}>
             {isEmpty ? (
               <div className="chat-empty">
-                <div className="chat-empty-icon">W</div>
+                <div className="chat-empty-icon">{ASSISTANT_AVATAR}</div>
                 <h2>How can I help you today?</h2>
-                <p>Ask about the weather or your location.</p>
+                <p>Ask anything — weather, location, or general questions.</p>
                 <div className="chat-suggestions">
                   {SUGGESTIONS.map((suggestion) => (
                     <button
@@ -478,11 +481,11 @@ function ChatPage() {
                 {messages.map((msg, i) => (
                   <article key={i} className="message">
                     <div className={`message-avatar ${msg.role}`}>
-                      {msg.role === "user" ? "Y" : "W"}
+                      {msg.role === "user" ? "Y" : ASSISTANT_AVATAR}
                     </div>
                     <div className="message-body">
                       <div className="message-label">
-                        {msg.role === "user" ? "You" : "Weather Agent"}
+                        {msg.role === "user" ? "You" : ASSISTANT_NAME}
                       </div>
                       {msg.content}
                     </div>
@@ -490,9 +493,9 @@ function ChatPage() {
                 ))}
                 {loading && (
                   <article className="message">
-                    <div className="message-avatar assistant">W</div>
+                    <div className="message-avatar assistant">{ASSISTANT_AVATAR}</div>
                     <div className="message-body">
-                      <div className="message-label">Weather Agent</div>
+                      <div className="message-label">{ASSISTANT_NAME}</div>
                       <div className="typing-indicator" aria-label="Thinking">
                         <span />
                         <span />
@@ -514,7 +517,7 @@ function ChatPage() {
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Message Weather Agent..."
+                  placeholder={`Message ${APP_NAME}...`}
                   rows={1}
                   disabled={loading}
                 />
@@ -538,7 +541,7 @@ function ChatPage() {
               </div>
             </form>
             <p className="chat-footer-note">
-              Weather Agent can make mistakes. Check important info.
+              {APP_NAME} can make mistakes. Check important info.
             </p>
           </div>
         </div>
