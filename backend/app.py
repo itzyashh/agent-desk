@@ -54,9 +54,17 @@ CORS_ORIGINS = [
     if origin.strip()
 ]
 
+# Appwrite Sites default + preview hosts (https://*.appwrite.network).
+# Set CORS_ORIGIN_REGEX="" on Render to disable. Add custom domains to CORS_ORIGINS.
+_cors_origin_regex = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"https://.*\.appwrite\.network",
+).strip()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=_cors_origin_regex or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
