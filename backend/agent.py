@@ -24,8 +24,8 @@ NEEDS_LOCATION_STATUS = "needs_location"
 NEEDS_LOCATION_PAYLOAD = {
     "status": NEEDS_LOCATION_STATUS,
     "message": (
-        "Browser location is required. Do not call get_location again. "
-        "Stop and wait for the client to provide coordinates."
+        "Browser location is not available yet. "
+        "Stop tool use for this turn; the client will send coordinates next."
     ),
 }
 
@@ -211,8 +211,9 @@ def get_location():
     """Get the user's current browser coordinates.
 
     Call this when the user asks about weather or location without naming a city.
-    If coordinates are unavailable, the tool returns status=needs_location.
-    After that response, do not call this tool again in the same turn.
+    If this returns status=needs_location, end the turn.
+    On a later turn, if the user (or client) provides coordinates, call get_location
+    again or use the provided latitude/longitude with get_weather.
     """
     coords = _request_location.get()
     if coords is None:
@@ -233,8 +234,12 @@ def create_llm_agent(checkpointer):
         debug=False,
         system_prompt=(
             "Give concise responses. "
-            "If get_location returns status=needs_location, stop immediately "
-            "and do not call any more tools."
+            "When the user message includes latitude and longitude, use them "
+            "directly with get_weather (or answer location questions from them). "
+            "Never ask the user to type coordinates. "
+            "If get_location returns status=needs_location, stop tool use for "
+            "that turn only. On a later turn with coordinates available, call "
+            "get_location again or use the provided coords."
         ),
         checkpointer=checkpointer,
     )

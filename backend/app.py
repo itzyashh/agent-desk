@@ -107,10 +107,20 @@ def chat(body: ChatRequest):
     config = {"configurable": {"thread_id": body.thread_id}}
     set_request_location(body.latitude, body.longitude)
 
+    message = body.message
+    if body.latitude is not None and body.longitude is not None:
+        message = (
+            f"{body.message}\n\n"
+            f"[device_location] latitude={body.latitude} "
+            f"longitude={body.longitude}\n"
+            "Use these coordinates now. Call get_weather if needed. "
+            "Do not ask the user for coordinates."
+        )
+
     try:
         _repair_pending_location_calls(config, body.latitude, body.longitude)
         response = agent.invoke(
-            {"messages": [{"role": "user", "content": body.message}]},
+            {"messages": [{"role": "user", "content": message}]},
             config,
         )
     except Exception as exc:
@@ -119,7 +129,12 @@ def chat(body: ChatRequest):
         clear_request_location()
 
     messages = response["messages"]
-    needs_location = location_required_in_messages(messages)
+    # Only treat as needs_location when we did not already receive coords
+    needs_location = (
+        body.latitude is None
+        and body.longitude is None
+        and location_required_in_messages(messages)
+    )
 
     if needs_location:
         return ChatResponse(

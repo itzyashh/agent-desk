@@ -290,7 +290,7 @@ function ChatPage() {
           const coords = await requestBrowserLocation();
           data = await postChat({
             message:
-              "User shared current coordinates. Continue with the previous request.",
+              "Device location is available. Continue answering the previous request using these coordinates.",
             thread_id: threadId,
             new: false,
             latitude: coords.latitude,
