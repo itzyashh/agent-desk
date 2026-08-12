@@ -62,9 +62,30 @@ const APP_NAME = "Agent Suite";
 const ASSISTANT_NAME = "Agent";
 const ASSISTANT_AVATAR = "A";
 
-const API_BASE = (
-  import.meta.env.VITE_API_URL ?? "http://localhost:8000"
-).replace(/\/$/, "");
+const API_BASE = resolveApiBase();
+
+function resolveApiBase(): string {
+  const configured = String(import.meta.env.VITE_API_URL ?? "")
+    .trim()
+    .replace(/\/$/, "");
+  const productionFallback = "https://agent-desk.onrender.com";
+  const localFallback = "http://localhost:8000";
+
+  if (!import.meta.env.PROD) {
+    return configured || localFallback;
+  }
+
+  // Hosted builds sometimes inherit a localhost VITE_API_URL from the
+  // deploy console; never ship that to real browsers.
+  if (
+    !configured ||
+    /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(configured)
+  ) {
+    return productionFallback;
+  }
+
+  return configured;
+}
 
 function getOrCreateDeviceId(): string {
   if (typeof window === "undefined") return crypto.randomUUID();
