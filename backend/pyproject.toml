@@ -22,8 +22,8 @@ dependencies = [
     "swagger-theme-toggle>=0.1.1",
 ]
 
-[project.scripts]
-agent-desk = "intro_ai:main"
+[tool.uv]
+package = false
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]

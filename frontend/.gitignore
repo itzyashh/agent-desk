@@ -4,6 +4,8 @@ dist
 dist-ssr
 *.local
 .env
+.env.local
+.env.*.local
 .nitro
 .tanstack
 .wrangler
@@ -11,3 +13,8 @@ dist-ssr
 .vinxi
 __unconfig*
 todos.json
+
+# Shared mode files (committed)
+!.env.development
+!.env.production
+!.env.example

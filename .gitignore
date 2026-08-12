@@ -1,9 +1,17 @@
 # OS
 .DS_Store
 
-# Secrets
+# Secrets / local overrides
 .env
 **/.env
+**/.env.local
+**/.env.*.local
+
+# Keep shared Vite mode files (no secrets)
+!frontend/.env.development
+!frontend/.env.production
+!frontend/.env.example
+!backend/.env.example
 
 # Python
 .venv/

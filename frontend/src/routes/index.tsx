@@ -38,7 +38,7 @@ const SUGGESTIONS = [
 const STORAGE_KEY = "weather-agent-conversations";
 
 const API_BASE = (
-  import.meta.env.VITE_API_URL ?? "https://agent-desk.onrender.com"
+  import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 ).replace(/\/$/, "");
 
 type StoredChatState = {
