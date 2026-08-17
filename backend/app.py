@@ -31,7 +31,6 @@ from google_store import (
     pop_oauth_state,
     save_oauth_state,
     setup_google_tables,
-    update_spreadsheet_id,
     upsert_connection,
 )
 from quota import (
@@ -357,7 +356,7 @@ def google_callback(
             refresh_token=refresh_token,
             token=creds.token,
             token_expiry=creds_expiry(creds),
-            spreadsheet_id=spreadsheet_id,
+            spreadsheet_id=None,
         )
 
     return HTMLResponse(callback_success_html(spreadsheet_id=spreadsheet_id))
@@ -371,8 +370,6 @@ def google_status(request: Request):
         row = get_connection(conn, device_id)
     return {
         "connected": row is not None,
-        "spreadsheet_id": row.spreadsheet_id if row else None,
-        "gid": row.gid if row else None,
     }
 
 
@@ -410,16 +407,10 @@ def google_sheet(request: Request, body: GoogleSheetLinkRequest):
                 status_code=401,
                 detail="Google is not connected",
             )
-        updated = update_spreadsheet_id(
-            conn,
-            device_id=device_id,
-            spreadsheet_id=body.spreadsheet_id,
-            gid=body.gid,
-        )
     return {
         "connected": True,
-        "spreadsheet_id": updated.spreadsheet_id if updated else body.spreadsheet_id,
-        "gid": updated.gid if updated else body.gid,
+        "spreadsheet_id": body.spreadsheet_id,
+        "gid": body.gid,
     }
 
 
@@ -433,26 +424,12 @@ def chat(request: Request, body: ChatRequest):
 
     parsed_id, parsed_gid = _parse_sheet_from_text(body.message)
     spreadsheet_id = body.spreadsheet_id or parsed_id
+    gid = body.gid or parsed_gid
     pool = _require_quota_pool()
-    with pool.connection() as conn:
-        row = get_connection(conn, device_id)
-        gid = body.gid or parsed_gid
-        if not gid and row and (not spreadsheet_id or spreadsheet_id == row.spreadsheet_id):
-            gid = row.gid
-        if row and spreadsheet_id and (
-            spreadsheet_id != row.spreadsheet_id or gid != row.gid
-        ):
-            update_spreadsheet_id(
-                conn,
-                device_id=device_id,
-                spreadsheet_id=spreadsheet_id,
-                gid=gid,
-            )
-        linked_id = spreadsheet_id or (row.spreadsheet_id if row else None)
 
     set_sheet_context(
         device_id=device_id,
-        spreadsheet_id=linked_id,
+        spreadsheet_id=spreadsheet_id,
         gid=gid,
         pool=pool,
     )

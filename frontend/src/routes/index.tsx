@@ -69,6 +69,20 @@ type Conversation = {
   title: string;
   messages: Message[];
   updatedAt: number;
+  spreadsheetId?: string | null;
+  gid?: string | null;
+  tabTitle?: string | null;
+};
+
+type PendingSheetPayload = {
+  sheet: SheetLink;
+  conversationId?: string;
+};
+
+type SendMessageOptions = {
+  conversationId?: string;
+  spreadsheetId?: string | null;
+  gid?: string | null;
 };
 
 const SUGGESTIONS = [
@@ -138,8 +152,6 @@ function persistGoogleConnected(connected: boolean) {
 
 type GoogleStatus = {
   connected: boolean;
-  spreadsheet_id: string | null;
-  gid: string | null;
 };
 
 async function fetchGoogleStatus(): Promise<GoogleStatus> {
@@ -149,35 +161,12 @@ async function fetchGoogleStatus(): Promise<GoogleStatus> {
     });
     const payload = await res.json().catch(() => null);
     if (!res.ok || !payload || typeof payload !== "object") {
-      return { connected: false, spreadsheet_id: null, gid: null };
+      return { connected: false };
     }
-    const data = payload as Record<string, unknown>;
-    return {
-      connected: data.connected === true,
-      spreadsheet_id:
-        typeof data.spreadsheet_id === "string" ? data.spreadsheet_id : null,
-      gid: typeof data.gid === "string" ? data.gid : null,
-    };
+    return { connected: (payload as { connected?: unknown }).connected === true };
   } catch {
-    return { connected: false, spreadsheet_id: null, gid: null };
+    return { connected: false };
   }
-}
-
-async function postLinkedSheet(
-  spreadsheetId: string,
-  gid?: string | null,
-): Promise<void> {
-  await fetch(`${API_BASE}/auth/google/sheet`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Device-Id": getOrCreateDeviceId(),
-    },
-    body: JSON.stringify({
-      spreadsheet_id: spreadsheetId,
-      gid: gid || null,
-    }),
-  });
 }
 
 async function fetchSheetTabs(spreadsheetId: string): Promise<SheetTab[]> {
@@ -241,9 +230,63 @@ function isSheetLinkOnly(text: string, sheet: SheetLink): boolean {
   }
 }
 
-function beginGoogleConnect(sheet: SheetLink) {
+function storePendingSheet(sheet: SheetLink, conversationId?: string) {
   if (typeof window === "undefined") return;
-  sessionStorage.setItem(PENDING_SHEET_KEY, JSON.stringify(sheet));
+  const payload: PendingSheetPayload = { sheet, conversationId };
+  sessionStorage.setItem(PENDING_SHEET_KEY, JSON.stringify(payload));
+}
+
+function takePendingSheet(): PendingSheetPayload | null {
+  if (typeof window === "undefined") return null;
+  const pendingRaw = sessionStorage.getItem(PENDING_SHEET_KEY);
+  sessionStorage.removeItem(PENDING_SHEET_KEY);
+  if (!pendingRaw) return null;
+  try {
+    const parsed = JSON.parse(pendingRaw) as Record<string, unknown>;
+    if (
+      parsed.sheet &&
+      typeof parsed.sheet === "object" &&
+      typeof (parsed.sheet as SheetLink).spreadsheetId === "string"
+    ) {
+      return {
+        sheet: parsed.sheet as SheetLink,
+        conversationId:
+          typeof parsed.conversationId === "string"
+            ? parsed.conversationId
+            : undefined,
+      };
+    }
+    if (typeof parsed.spreadsheetId === "string") {
+      return { sheet: parsed as unknown as SheetLink };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function inferLinkedSheet(messages: Message[]): {
+  spreadsheetId?: string;
+  gid?: string;
+  tabTitle?: string;
+} {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role !== "user") continue;
+    const parsed = parseGoogleSheetLink(msg.content);
+    if (parsed) {
+      return {
+        spreadsheetId: parsed.spreadsheetId,
+        gid: parsed.gid,
+      };
+    }
+  }
+  return {};
+}
+
+function beginGoogleConnect(sheet: SheetLink, conversationId?: string) {
+  if (typeof window === "undefined") return;
+  storePendingSheet(sheet, conversationId);
   const params = new URLSearchParams({
     device_id: getOrCreateDeviceId(),
     spreadsheet_id: sheet.spreadsheetId,
@@ -406,6 +449,17 @@ type StoredChatState = {
   activeId: string;
 };
 
+function normalizeConversation(raw: Conversation): Conversation {
+  const inferred = raw.spreadsheetId ? {} : inferLinkedSheet(raw.messages ?? []);
+  return {
+    ...raw,
+    messages: Array.isArray(raw.messages) ? raw.messages : [],
+    spreadsheetId: raw.spreadsheetId ?? inferred.spreadsheetId ?? null,
+    gid: raw.gid ?? inferred.gid ?? null,
+    tabTitle: raw.tabTitle ?? inferred.tabTitle ?? null,
+  };
+}
+
 function loadStoredState(): StoredChatState | null {
   if (typeof window === "undefined") return null;
 
@@ -418,10 +472,11 @@ function loadStoredState(): StoredChatState | null {
       return null;
     }
 
-    const activeExists = parsed.conversations.some((c) => c.id === parsed.activeId);
+    const conversations = parsed.conversations.map(normalizeConversation);
+    const activeExists = conversations.some((c) => c.id === parsed.activeId);
     return {
-      conversations: parsed.conversations,
-      activeId: activeExists ? parsed.activeId : parsed.conversations[0].id,
+      conversations,
+      activeId: activeExists ? parsed.activeId : conversations[0].id,
     };
   } catch {
     return null;
@@ -557,17 +612,16 @@ function ChatPage() {
     useState<SheetLink | null>(null);
   const [pendingTabs, setPendingTabs] = useState<SheetTab[]>([]);
   const [googleConnected, setGoogleConnected] = useState(false);
-  const [linkedSpreadsheetId, setLinkedSpreadsheetId] = useState<string | null>(
-    null,
-  );
-  const [linkedGid, setLinkedGid] = useState<string | null>(null);
-  const [linkedTabTitle, setLinkedTabTitle] = useState<string | null>(null);
-  const sendMessageRef = useRef<(text: string) => Promise<void>>(
-    async () => undefined,
-  );
-  const pickOrSendSheetRef = useRef<(sheet: SheetLink) => Promise<void>>(
-    async () => undefined,
-  );
+  const sendMessageRef = useRef<
+    (text: string, options?: SendMessageOptions) => Promise<void>
+  >(async () => undefined);
+  const pickOrSendSheetRef = useRef<
+    (
+      sheet: SheetLink,
+      userMessage?: string,
+      conversationId?: string,
+    ) => Promise<void>
+  >(async () => undefined);
   const [animatingTitleIds, setAnimatingTitleIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -600,8 +654,6 @@ function ChatPage() {
       if (cancelled) return;
       persistGoogleConnected(status.connected);
       setGoogleConnected(status.connected);
-      setLinkedSpreadsheetId(status.spreadsheet_id);
-      setLinkedGid(status.gid);
 
       const params = new URLSearchParams(window.location.search);
       if (params.get("google") === "connected") {
@@ -610,15 +662,13 @@ function ChatPage() {
         const next = params.toString();
         const path = `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`;
         window.history.replaceState({}, "", path);
-        const pendingRaw = sessionStorage.getItem(PENDING_SHEET_KEY);
-        sessionStorage.removeItem(PENDING_SHEET_KEY);
-        if (status.connected && pendingRaw) {
-          try {
-            const sheet = JSON.parse(pendingRaw) as SheetLink;
-            await pickOrSendSheetRef.current(sheet);
-          } catch {
-            // ignore malformed pending sheet
-          }
+        const pending = takePendingSheet();
+        if (status.connected && pending) {
+          await pickOrSendSheetRef.current(
+            pending.sheet,
+            undefined,
+            pending.conversationId,
+          );
         }
       }
     }
@@ -640,17 +690,13 @@ function ChatPage() {
         const status = await fetchGoogleStatus();
         persistGoogleConnected(status.connected);
         setGoogleConnected(status.connected);
-        setLinkedSpreadsheetId(status.spreadsheet_id);
-        setLinkedGid(status.gid);
-        const pendingRaw = sessionStorage.getItem(PENDING_SHEET_KEY);
-        sessionStorage.removeItem(PENDING_SHEET_KEY);
-        if (status.connected && pendingRaw) {
-          try {
-            const sheet = JSON.parse(pendingRaw) as SheetLink;
-            await pickOrSendSheetRef.current(sheet);
-          } catch {
-            // ignore malformed pending sheet
-          }
+        const pending = takePendingSheet();
+        if (status.connected && pending) {
+          await pickOrSendSheetRef.current(
+            pending.sheet,
+            undefined,
+            pending.conversationId,
+          );
         }
       })();
     }
@@ -667,6 +713,9 @@ function ChatPage() {
   const activeConversation =
     conversations.find((c) => c.id === activeId) ?? conversations[0];
   const messages = activeConversation?.messages ?? [];
+  const linkedSpreadsheetId = activeConversation?.spreadsheetId ?? null;
+  const linkedGid = activeConversation?.gid ?? null;
+  const linkedTabTitle = activeConversation?.tabTitle ?? null;
 
   useEffect(() => {
     const container = messagesContainerRef.current;
@@ -680,6 +729,52 @@ function ChatPage() {
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 128)}px`;
   }, [input, activeId]);
+
+  useEffect(() => {
+    if (
+      !googleConnected ||
+      !activeConversation?.spreadsheetId ||
+      activeConversation.tabTitle
+    ) {
+      return;
+    }
+    const conversationId = activeConversation.id;
+    const spreadsheetId = activeConversation.spreadsheetId;
+    const gid = activeConversation.gid;
+    let cancelled = false;
+    void (async () => {
+      const tabs = await fetchSheetTabs(spreadsheetId);
+      if (cancelled || !tabs.length) return;
+      const title =
+        tabs.find((tab) => tab.gid === gid)?.title ?? tabs[0]?.title ?? null;
+      if (!title) return;
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (
+            c.id !== conversationId ||
+            c.tabTitle ||
+            c.spreadsheetId !== spreadsheetId
+          ) {
+            return c;
+          }
+          return {
+            ...c,
+            gid: c.gid ?? gid ?? tabs[0].gid,
+            tabTitle: title,
+          };
+        }),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    googleConnected,
+    activeConversation?.id,
+    activeConversation?.spreadsheetId,
+    activeConversation?.gid,
+    activeConversation?.tabTitle,
+  ]);
 
   function clearTitleAnimation(id: string) {
     setAnimatingTitleIds((prev) => {
@@ -704,17 +799,25 @@ function ChatPage() {
     setConversations((prev) => [conversation, ...prev]);
     setActiveId(conversation.id);
     setInput("");
+    setPendingComposerSheet(null);
+    setPendingTabs([]);
     setSidebarOpen(false);
   }
 
   function selectConversation(id: string) {
     setActiveId(id);
     setInput("");
+    setPendingComposerSheet(null);
+    setPendingTabs([]);
     setSidebarOpen(false);
   }
 
   function deleteConversation(id: string, e: React.MouseEvent) {
     e.stopPropagation();
+    if (id === activeId) {
+      setPendingComposerSheet(null);
+      setPendingTabs([]);
+    }
     setConversations((prev) => {
       const next = prev.filter((c) => c.id !== id);
       if (next.length === 0) {
@@ -729,20 +832,42 @@ function ChatPage() {
     });
   }
 
+  function attachSheetToConversation(
+    conversationId: string,
+    sheet: {
+      spreadsheetId: string;
+      gid?: string | null;
+      tabTitle?: string | null;
+    },
+  ) {
+    updateConversation(conversationId, (c) => ({
+      ...c,
+      spreadsheetId: sheet.spreadsheetId,
+      gid: sheet.gid ?? null,
+      tabTitle: sheet.tabTitle ?? null,
+      updatedAt: Date.now(),
+    }));
+  }
+
   function showSheetConnectPrompt(
     sheet: SheetLink,
     userMessage?: string,
+    conversationId?: string,
   ) {
-    if (!activeConversation) return;
+    const target =
+      (conversationId
+        ? conversations.find((c) => c.id === conversationId)
+        : null) ?? activeConversation;
+    if (!target) return;
 
-    const conversationId = activeConversation.id;
-    const isFirstMessage = activeConversation.messages.length === 0;
+    const targetId = target.id;
+    const isFirstMessage = target.messages.length === 0;
 
     if (isFirstMessage) {
-      setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
+      setAnimatingTitleIds((prev) => new Set(prev).add(targetId));
     }
 
-    updateConversation(conversationId, (c) => {
+    updateConversation(targetId, (c) => {
       const alreadyPrompted = c.messages.some(
         (m) =>
           m.kind === "google-connect" &&
@@ -781,17 +906,22 @@ function ChatPage() {
     sheet: SheetLink,
     tabs: SheetTab[],
     userMessage?: string,
+    conversationId?: string,
   ) {
-    if (!activeConversation) return;
+    const target =
+      (conversationId
+        ? conversations.find((c) => c.id === conversationId)
+        : null) ?? activeConversation;
+    if (!target) return;
 
-    const conversationId = activeConversation.id;
-    const isFirstMessage = activeConversation.messages.length === 0;
+    const targetId = target.id;
+    const isFirstMessage = target.messages.length === 0;
 
     if (isFirstMessage) {
-      setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
+      setAnimatingTitleIds((prev) => new Set(prev).add(targetId));
     }
 
-    updateConversation(conversationId, (c) => {
+    updateConversation(targetId, (c) => {
       const alreadyPrompted = c.messages.some(
         (m) =>
           m.kind === "sheet-picker" &&
@@ -827,51 +957,79 @@ function ChatPage() {
     });
   }
 
-  async function pickOrSendSheet(sheet: SheetLink, userMessage?: string) {
+  async function pickOrSendSheet(
+    sheet: SheetLink,
+    userMessage?: string,
+    conversationId?: string,
+  ) {
+    const targetId = conversationId || activeConversation?.id;
+    if (!targetId) return;
+
+    if (conversationId && conversationId !== activeId) {
+      setActiveId(conversationId);
+    }
+
     const tabs = await fetchSheetTabs(sheet.spreadsheetId);
     if (sheet.gid || tabs.length <= 1) {
       const gid = sheet.gid ?? tabs[0]?.gid;
       const title = tabs.find((tab) => tab.gid === gid)?.title ?? null;
-      try {
-        await postLinkedSheet(sheet.spreadsheetId, gid);
-      } catch {
-        // chat can still try with the id on the request body
-      }
-      setLinkedSpreadsheetId(sheet.spreadsheetId);
-      setLinkedGid(gid ?? null);
-      setLinkedTabTitle(title);
+      attachSheetToConversation(targetId, {
+        spreadsheetId: sheet.spreadsheetId,
+        gid,
+        tabTitle: title,
+      });
       setPendingComposerSheet(null);
       setPendingTabs([]);
-      await sendMessageRef.current(userMessage ?? sheet.url);
+      await sendMessageRef.current(userMessage ?? sheet.url, {
+        conversationId: targetId,
+        spreadsheetId: sheet.spreadsheetId,
+        gid,
+      });
       return;
     }
 
     setPendingComposerSheet(sheet);
     setPendingTabs(tabs);
-    showSheetPickerPrompt(sheet, tabs, userMessage);
+    showSheetPickerPrompt(sheet, tabs, userMessage, targetId);
   }
 
   async function selectSheetTab(sheet: SheetLink, tab: SheetTab) {
-    try {
-      await postLinkedSheet(sheet.spreadsheetId, tab.gid);
-    } catch {
-      // still continue locally
-    }
-    setLinkedSpreadsheetId(sheet.spreadsheetId);
-    setLinkedGid(tab.gid);
-    setLinkedTabTitle(tab.title);
+    const targetId = activeConversation?.id;
+    if (!targetId) return;
+    attachSheetToConversation(targetId, {
+      spreadsheetId: sheet.spreadsheetId,
+      gid: tab.gid,
+      tabTitle: tab.title,
+    });
     setPendingComposerSheet(null);
     setPendingTabs([]);
     persistGoogleConnected(true);
-    await sendMessageRef.current(sheetUrlWithGid(sheet.spreadsheetId, tab.gid));
+    await sendMessageRef.current(sheetUrlWithGid(sheet.spreadsheetId, tab.gid), {
+      conversationId: targetId,
+      spreadsheetId: sheet.spreadsheetId,
+      gid: tab.gid,
+    });
   }
 
   pickOrSendSheetRef.current = pickOrSendSheet;
 
-  async function sendMessage(text: string) {
+  async function sendMessage(text: string, options?: SendMessageOptions) {
     const userMessage = text.trim();
-    if (!userMessage || loading || !activeConversation) return;
+    if (!userMessage || loading) return;
     if (quota && quota.tokensRemaining <= 0) return;
+
+    const conversation =
+      (options?.conversationId
+        ? conversations.find((c) => c.id === options.conversationId)
+        : null) ?? activeConversation;
+    if (!conversation) return;
+
+    const conversationId = conversation.id;
+    const threadId = conversation.threadId;
+    const isFirstMessage = conversation.messages.length === 0;
+    let spreadsheetId =
+      options?.spreadsheetId ?? conversation.spreadsheetId ?? undefined;
+    let gid = options?.gid ?? conversation.gid ?? undefined;
 
     const sheet = parseGoogleSheetLink(userMessage);
     if (sheet && !isGoogleConnected()) {
@@ -879,7 +1037,7 @@ function ChatPage() {
         pendingComposerSheet?.spreadsheetId === sheet.spreadsheetId;
       if (!caughtInComposer) {
         setInput("");
-        showSheetConnectPrompt(sheet, userMessage);
+        showSheetConnectPrompt(sheet, userMessage, conversationId);
         return;
       }
       if (isSheetLinkOnly(userMessage, sheet)) {
@@ -888,34 +1046,30 @@ function ChatPage() {
     }
 
     if (sheet && isGoogleConnected()) {
+      const resolvedGid = sheet.gid ?? options?.gid ?? undefined;
       const tabs = pendingTabs.length
         ? pendingTabs
         : await fetchSheetTabs(sheet.spreadsheetId);
-      if (!sheet.gid && tabs.length > 1) {
+      if (!resolvedGid && tabs.length > 1) {
         setInput("");
         setPendingComposerSheet(sheet);
         setPendingTabs(tabs);
-        showSheetPickerPrompt(sheet, tabs, userMessage);
+        showSheetPickerPrompt(sheet, tabs, userMessage, conversationId);
         return;
       }
-      const gid = sheet.gid ?? tabs[0]?.gid;
-      try {
-        await postLinkedSheet(sheet.spreadsheetId, gid);
-        setLinkedSpreadsheetId(sheet.spreadsheetId);
-        setLinkedGid(gid ?? null);
-        setLinkedTabTitle(tabs.find((tab) => tab.gid === gid)?.title ?? null);
-        setPendingComposerSheet(null);
-        setPendingTabs([]);
-      } catch {
-        // chat can still try with the id on the request body
-      }
+      const nextGid = resolvedGid ?? tabs[0]?.gid;
+      attachSheetToConversation(conversationId, {
+        spreadsheetId: sheet.spreadsheetId,
+        gid: nextGid,
+        tabTitle: tabs.find((tab) => tab.gid === nextGid)?.title ?? null,
+      });
+      spreadsheetId = sheet.spreadsheetId;
+      gid = nextGid;
+      setPendingComposerSheet(null);
+      setPendingTabs([]);
     }
 
     setInput("");
-
-    const conversationId = activeConversation.id;
-    const threadId = activeConversation.threadId;
-    const isFirstMessage = activeConversation.messages.length === 0;
 
     updateConversation(conversationId, (c) => ({
       ...c,
@@ -930,8 +1084,8 @@ function ChatPage() {
         message: userMessage,
         thread_id: threadId,
         new: isFirstMessage,
-        spreadsheet_id: sheet?.spreadsheetId ?? linkedSpreadsheetId ?? undefined,
-        gid: sheet?.gid ?? linkedGid ?? undefined,
+        spreadsheet_id: spreadsheetId,
+        gid,
       });
       applyQuotaFromResponse(data);
 
@@ -945,8 +1099,8 @@ function ChatPage() {
             new: false,
             latitude: coords.latitude,
             longitude: coords.longitude,
-            spreadsheet_id: linkedSpreadsheetId ?? undefined,
-            gid: linkedGid ?? undefined,
+            spreadsheet_id: spreadsheetId,
+            gid,
           });
           applyQuotaFromResponse(data);
         } catch (error) {
@@ -1003,9 +1157,9 @@ function ChatPage() {
         userMessage.slice(0, 36) + (userMessage.length > 36 ? "…" : "");
       const newTitle =
         data.conversation_name ??
-        (isFirstMessage ? fallbackTitle : activeConversation.title);
+        (isFirstMessage ? fallbackTitle : conversation.title);
 
-      if (isFirstMessage && newTitle !== activeConversation.title) {
+      if (isFirstMessage && newTitle !== conversation.title) {
         setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
       }
 
@@ -1205,7 +1359,12 @@ function ChatPage() {
                       {msg.kind === "google-connect" && msg.sheet ? (
                         <GoogleConnectCard
                           sheet={msg.sheet}
-                          onConnect={() => beginGoogleConnect(msg.sheet!)}
+                          onConnect={() =>
+                            beginGoogleConnect(
+                              msg.sheet!,
+                              activeConversation?.id,
+                            )
+                          }
                         />
                       ) : msg.kind === "sheet-picker" && msg.sheet && msg.tabs ? (
                         <SheetPickerCard
@@ -1262,7 +1421,12 @@ function ChatPage() {
                   <GoogleConnectCard
                     compact
                     sheet={pendingComposerSheet}
-                    onConnect={() => beginGoogleConnect(pendingComposerSheet)}
+                    onConnect={() =>
+                      beginGoogleConnect(
+                        pendingComposerSheet,
+                        activeConversation?.id,
+                      )
+                    }
                     onDismiss={() => setPendingComposerSheet(null)}
                   />
                 )}

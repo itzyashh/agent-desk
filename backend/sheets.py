@@ -82,7 +82,7 @@ def _spreadsheet_service():
                 token_expiry=creds_expiry(creds),
                 refresh_token=creds.refresh_token,
             )
-        spreadsheet_id = ctx.spreadsheet_id or row.spreadsheet_id
+        spreadsheet_id = ctx.spreadsheet_id
 
     if not spreadsheet_id:
         return None, {
@@ -114,7 +114,7 @@ def list_tabs_for_device(
                 token_expiry=creds_expiry(creds),
                 refresh_token=creds.refresh_token,
             )
-        linked_id = spreadsheet_id or row.spreadsheet_id
+        linked_id = spreadsheet_id
 
     if not linked_id:
         return {
