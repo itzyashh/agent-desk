@@ -1,11 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 export const Route = createFileRoute("/")({
   component: ChatPage,
 });
 
-type Message = { role: "user" | "assistant"; content: string };
+type SheetTab = {
+  gid: string;
+  title: string;
+};
+
+type SheetLink = {
+  url: string;
+  spreadsheetId: string;
+  gid?: string;
+};
+
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+  kind?: "text" | "google-connect" | "sheet-picker";
+  sheet?: SheetLink;
+  tabs?: SheetTab[];
+};
 
 type ChatApiResponse = {
   reply: string;
@@ -28,6 +47,8 @@ type ChatRequestBody = {
   new?: boolean;
   latitude?: number;
   longitude?: number;
+  spreadsheet_id?: string;
+  gid?: string;
 };
 
 class ChatApiError extends Error {
@@ -58,6 +79,12 @@ const SUGGESTIONS = [
 
 const STORAGE_KEY = "agent-suite-conversations";
 const DEVICE_ID_KEY = "agent-suite-device-id";
+const GOOGLE_CONNECTED_KEY = "agent-suite-google-connected";
+const PENDING_SHEET_KEY = "agent-suite-pending-sheet";
+const GOOGLE_LOGO_SRC = "https://img.icons8.com/?id=17949&format=png&size=48";
+const SHEETS_ICON_SRC = "https://img.icons8.com/?id=30461&format=png&size=48";
+const SHEET_URL_RE =
+  /https?:\/\/docs\.google\.com\/spreadsheets\/d\/(?!e\/)([a-zA-Z0-9-_]{20,})/i;
 const APP_NAME = "Agent Suite";
 const ASSISTANT_NAME = "Agent";
 const ASSISTANT_AVATAR = "A";
@@ -96,6 +123,258 @@ function getOrCreateDeviceId(): string {
   const id = crypto.randomUUID();
   localStorage.setItem(DEVICE_ID_KEY, id);
   return id;
+}
+
+function isGoogleConnected(): boolean {
+  if (typeof window === "undefined") return false;
+  return localStorage.getItem(GOOGLE_CONNECTED_KEY) === "true";
+}
+
+function persistGoogleConnected(connected: boolean) {
+  if (typeof window === "undefined") return;
+  if (connected) localStorage.setItem(GOOGLE_CONNECTED_KEY, "true");
+  else localStorage.removeItem(GOOGLE_CONNECTED_KEY);
+}
+
+type GoogleStatus = {
+  connected: boolean;
+  spreadsheet_id: string | null;
+  gid: string | null;
+};
+
+async function fetchGoogleStatus(): Promise<GoogleStatus> {
+  try {
+    const res = await fetch(`${API_BASE}/auth/google/status`, {
+      headers: { "X-Device-Id": getOrCreateDeviceId() },
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok || !payload || typeof payload !== "object") {
+      return { connected: false, spreadsheet_id: null, gid: null };
+    }
+    const data = payload as Record<string, unknown>;
+    return {
+      connected: data.connected === true,
+      spreadsheet_id:
+        typeof data.spreadsheet_id === "string" ? data.spreadsheet_id : null,
+      gid: typeof data.gid === "string" ? data.gid : null,
+    };
+  } catch {
+    return { connected: false, spreadsheet_id: null, gid: null };
+  }
+}
+
+async function postLinkedSheet(
+  spreadsheetId: string,
+  gid?: string | null,
+): Promise<void> {
+  await fetch(`${API_BASE}/auth/google/sheet`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Device-Id": getOrCreateDeviceId(),
+    },
+    body: JSON.stringify({
+      spreadsheet_id: spreadsheetId,
+      gid: gid || null,
+    }),
+  });
+}
+
+async function fetchSheetTabs(spreadsheetId: string): Promise<SheetTab[]> {
+  const res = await fetch(
+    `${API_BASE}/auth/google/tabs?spreadsheet_id=${encodeURIComponent(spreadsheetId)}`,
+    { headers: { "X-Device-Id": getOrCreateDeviceId() } },
+  );
+  const payload = await res.json().catch(() => null);
+  if (!res.ok || !payload || typeof payload !== "object") return [];
+  const tabs = (payload as { tabs?: unknown }).tabs;
+  if (!Array.isArray(tabs)) return [];
+  return tabs.filter(
+    (tab): tab is SheetTab =>
+      !!tab &&
+      typeof tab === "object" &&
+      typeof (tab as SheetTab).gid === "string" &&
+      typeof (tab as SheetTab).title === "string",
+  );
+}
+
+function sheetUrlWithGid(spreadsheetId: string, gid: string): string {
+  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit?gid=${gid}#gid=${gid}`;
+}
+
+function apiOrigin(): string {
+  try {
+    return new URL(API_BASE).origin;
+  } catch {
+    return "";
+  }
+}
+
+function parseGoogleSheetLink(text: string): SheetLink | null {
+  const match = text.match(SHEET_URL_RE);
+  if (!match) return null;
+
+  const spreadsheetId = match[1];
+  const url = match[0];
+  const gidMatch = text.match(/[?&#]gid=(\d+)/);
+
+  return {
+    url,
+    spreadsheetId,
+    gid: gidMatch?.[1],
+  };
+}
+
+function isSheetLinkOnly(text: string, sheet: SheetLink): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || /\s/.test(trimmed)) return false;
+  if (trimmed === sheet.url || trimmed.startsWith(sheet.url)) return true;
+
+  try {
+    const parsed = new URL(trimmed);
+    return (
+      parsed.hostname === "docs.google.com" &&
+      parsed.pathname.includes(`/spreadsheets/d/${sheet.spreadsheetId}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function beginGoogleConnect(sheet: SheetLink) {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(PENDING_SHEET_KEY, JSON.stringify(sheet));
+  const params = new URLSearchParams({
+    device_id: getOrCreateDeviceId(),
+    spreadsheet_id: sheet.spreadsheetId,
+  });
+  const url = `${API_BASE}/auth/google/start?${params.toString()}`;
+  const popup = window.open(
+    url,
+    "google-connect",
+    "popup=yes,width=520,height=720",
+  );
+  if (!popup) {
+    window.location.assign(url);
+  }
+}
+
+function GoogleConnectCard({
+  sheet,
+  onConnect,
+  onDismiss,
+  compact = false,
+}: {
+  sheet: SheetLink;
+  onConnect: () => void;
+  onDismiss?: () => void;
+  compact?: boolean;
+}) {
+  const shortId =
+    sheet.spreadsheetId.length > 18
+      ? `${sheet.spreadsheetId.slice(0, 10)}…${sheet.spreadsheetId.slice(-6)}`
+      : sheet.spreadsheetId;
+
+  return (
+    <div className={`connector-card${compact ? " connector-card-compact" : ""}`}>
+      <div className="connector-card-top">
+        <img
+          className="connector-card-icon"
+          src={SHEETS_ICON_SRC}
+          alt=""
+          width={compact ? 22 : 28}
+          height={compact ? 22 : 28}
+        />
+        <div className="connector-card-copy">
+          <div className="connector-card-title">Please connect with Google</div>
+          <p className="connector-card-body">
+            {compact
+              ? "Connect your Google account to use this sheet in chat."
+              : "I found a Google Sheet. Connect your Google account so I can read and update it from this chat."}
+          </p>
+          <a
+            className="connector-card-sheet"
+            href={sheet.url}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {shortId}
+          </a>
+        </div>
+        {onDismiss && (
+          <button
+            type="button"
+            className="connector-dismiss"
+            aria-label="Dismiss"
+            onClick={onDismiss}
+          >
+            ×
+          </button>
+        )}
+      </div>
+      <button type="button" className="google-connect-btn" onClick={onConnect}>
+        <img src={GOOGLE_LOGO_SRC} alt="" width={18} height={18} />
+        Connect with Google
+      </button>
+    </div>
+  );
+}
+
+function SheetPickerCard({
+  tabs,
+  selectedGid,
+  onSelect,
+  onDismiss,
+  compact = false,
+}: {
+  tabs: SheetTab[];
+  selectedGid?: string | null;
+  onSelect: (tab: SheetTab) => void;
+  onDismiss?: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={`connector-card${compact ? " connector-card-compact" : ""}`}>
+      <div className="connector-card-top">
+        <img
+          className="connector-card-icon"
+          src={SHEETS_ICON_SRC}
+          alt=""
+          width={compact ? 22 : 28}
+          height={compact ? 22 : 28}
+        />
+        <div className="connector-card-copy">
+          <div className="connector-card-title">Choose a sheet tab</div>
+          <p className="connector-card-body">
+            This spreadsheet has {tabs.length} tabs. Pick which one to use in
+            chat.
+          </p>
+        </div>
+        {onDismiss && (
+          <button
+            type="button"
+            className="connector-dismiss"
+            aria-label="Dismiss"
+            onClick={onDismiss}
+          >
+            ×
+          </button>
+        )}
+      </div>
+      <div className="sheet-tab-list">
+        {tabs.map((tab) => (
+          <button
+            key={tab.gid}
+            type="button"
+            className={`sheet-tab-btn${selectedGid === tab.gid ? " selected" : ""}`}
+            onClick={() => onSelect(tab)}
+          >
+            {tab.title}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function quotaFromPayload(payload: unknown): QuotaInfo | undefined {
@@ -274,6 +553,21 @@ function ChatPage() {
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
+  const [pendingComposerSheet, setPendingComposerSheet] =
+    useState<SheetLink | null>(null);
+  const [pendingTabs, setPendingTabs] = useState<SheetTab[]>([]);
+  const [googleConnected, setGoogleConnected] = useState(false);
+  const [linkedSpreadsheetId, setLinkedSpreadsheetId] = useState<string | null>(
+    null,
+  );
+  const [linkedGid, setLinkedGid] = useState<string | null>(null);
+  const [linkedTabTitle, setLinkedTabTitle] = useState<string | null>(null);
+  const sendMessageRef = useRef<(text: string) => Promise<void>>(
+    async () => undefined,
+  );
+  const pickOrSendSheetRef = useRef<(sheet: SheetLink) => Promise<void>>(
+    async () => undefined,
+  );
   const [animatingTitleIds, setAnimatingTitleIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -296,6 +590,73 @@ function ChatPage() {
       setActiveId(fresh.id);
     }
     setReady(true);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function hydrateGoogle() {
+      const status = await fetchGoogleStatus();
+      if (cancelled) return;
+      persistGoogleConnected(status.connected);
+      setGoogleConnected(status.connected);
+      setLinkedSpreadsheetId(status.spreadsheet_id);
+      setLinkedGid(status.gid);
+
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("google") === "connected") {
+        params.delete("google");
+        params.delete("spreadsheet_id");
+        const next = params.toString();
+        const path = `${window.location.pathname}${next ? `?${next}` : ""}${window.location.hash}`;
+        window.history.replaceState({}, "", path);
+        const pendingRaw = sessionStorage.getItem(PENDING_SHEET_KEY);
+        sessionStorage.removeItem(PENDING_SHEET_KEY);
+        if (status.connected && pendingRaw) {
+          try {
+            const sheet = JSON.parse(pendingRaw) as SheetLink;
+            await pickOrSendSheetRef.current(sheet);
+          } catch {
+            // ignore malformed pending sheet
+          }
+        }
+      }
+    }
+
+    void hydrateGoogle();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (event.origin !== apiOrigin()) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if ((data as { type?: string }).type !== "google-connected") return;
+
+      void (async () => {
+        const status = await fetchGoogleStatus();
+        persistGoogleConnected(status.connected);
+        setGoogleConnected(status.connected);
+        setLinkedSpreadsheetId(status.spreadsheet_id);
+        setLinkedGid(status.gid);
+        const pendingRaw = sessionStorage.getItem(PENDING_SHEET_KEY);
+        sessionStorage.removeItem(PENDING_SHEET_KEY);
+        if (status.connected && pendingRaw) {
+          try {
+            const sheet = JSON.parse(pendingRaw) as SheetLink;
+            await pickOrSendSheetRef.current(sheet);
+          } catch {
+            // ignore malformed pending sheet
+          }
+        }
+      })();
+    }
+
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
   }, []);
 
   useEffect(() => {
@@ -368,10 +729,187 @@ function ChatPage() {
     });
   }
 
+  function showSheetConnectPrompt(
+    sheet: SheetLink,
+    userMessage?: string,
+  ) {
+    if (!activeConversation) return;
+
+    const conversationId = activeConversation.id;
+    const isFirstMessage = activeConversation.messages.length === 0;
+
+    if (isFirstMessage) {
+      setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
+    }
+
+    updateConversation(conversationId, (c) => {
+      const alreadyPrompted = c.messages.some(
+        (m) =>
+          m.kind === "google-connect" &&
+          m.sheet?.spreadsheetId === sheet.spreadsheetId,
+      );
+      const nextMessages = [...c.messages];
+
+      if (userMessage) {
+        const last = nextMessages[nextMessages.length - 1];
+        const lastWasSame =
+          last?.role === "user" && last.content.trim() === userMessage.trim();
+        if (!lastWasSame) {
+          nextMessages.push({ role: "user", content: userMessage });
+        }
+      }
+
+      if (!alreadyPrompted) {
+        nextMessages.push({
+          role: "assistant",
+          kind: "google-connect",
+          content: "Please connect with Google to work with this spreadsheet.",
+          sheet,
+        });
+      }
+
+      return {
+        ...c,
+        title: isFirstMessage ? "Google Sheet" : c.title,
+        updatedAt: Date.now(),
+        messages: nextMessages,
+      };
+    });
+  }
+
+  function showSheetPickerPrompt(
+    sheet: SheetLink,
+    tabs: SheetTab[],
+    userMessage?: string,
+  ) {
+    if (!activeConversation) return;
+
+    const conversationId = activeConversation.id;
+    const isFirstMessage = activeConversation.messages.length === 0;
+
+    if (isFirstMessage) {
+      setAnimatingTitleIds((prev) => new Set(prev).add(conversationId));
+    }
+
+    updateConversation(conversationId, (c) => {
+      const alreadyPrompted = c.messages.some(
+        (m) =>
+          m.kind === "sheet-picker" &&
+          m.sheet?.spreadsheetId === sheet.spreadsheetId,
+      );
+      const nextMessages = [...c.messages];
+
+      if (userMessage) {
+        const last = nextMessages[nextMessages.length - 1];
+        const lastWasSame =
+          last?.role === "user" && last.content.trim() === userMessage.trim();
+        if (!lastWasSame) {
+          nextMessages.push({ role: "user", content: userMessage });
+        }
+      }
+
+      if (!alreadyPrompted) {
+        nextMessages.push({
+          role: "assistant",
+          kind: "sheet-picker",
+          content: "Choose a sheet tab to continue.",
+          sheet,
+          tabs,
+        });
+      }
+
+      return {
+        ...c,
+        title: isFirstMessage ? "Google Sheet" : c.title,
+        updatedAt: Date.now(),
+        messages: nextMessages,
+      };
+    });
+  }
+
+  async function pickOrSendSheet(sheet: SheetLink, userMessage?: string) {
+    const tabs = await fetchSheetTabs(sheet.spreadsheetId);
+    if (sheet.gid || tabs.length <= 1) {
+      const gid = sheet.gid ?? tabs[0]?.gid;
+      const title = tabs.find((tab) => tab.gid === gid)?.title ?? null;
+      try {
+        await postLinkedSheet(sheet.spreadsheetId, gid);
+      } catch {
+        // chat can still try with the id on the request body
+      }
+      setLinkedSpreadsheetId(sheet.spreadsheetId);
+      setLinkedGid(gid ?? null);
+      setLinkedTabTitle(title);
+      setPendingComposerSheet(null);
+      setPendingTabs([]);
+      await sendMessageRef.current(userMessage ?? sheet.url);
+      return;
+    }
+
+    setPendingComposerSheet(sheet);
+    setPendingTabs(tabs);
+    showSheetPickerPrompt(sheet, tabs, userMessage);
+  }
+
+  async function selectSheetTab(sheet: SheetLink, tab: SheetTab) {
+    try {
+      await postLinkedSheet(sheet.spreadsheetId, tab.gid);
+    } catch {
+      // still continue locally
+    }
+    setLinkedSpreadsheetId(sheet.spreadsheetId);
+    setLinkedGid(tab.gid);
+    setLinkedTabTitle(tab.title);
+    setPendingComposerSheet(null);
+    setPendingTabs([]);
+    persistGoogleConnected(true);
+    await sendMessageRef.current(sheetUrlWithGid(sheet.spreadsheetId, tab.gid));
+  }
+
+  pickOrSendSheetRef.current = pickOrSendSheet;
+
   async function sendMessage(text: string) {
     const userMessage = text.trim();
     if (!userMessage || loading || !activeConversation) return;
     if (quota && quota.tokensRemaining <= 0) return;
+
+    const sheet = parseGoogleSheetLink(userMessage);
+    if (sheet && !isGoogleConnected()) {
+      const caughtInComposer =
+        pendingComposerSheet?.spreadsheetId === sheet.spreadsheetId;
+      if (!caughtInComposer) {
+        setInput("");
+        showSheetConnectPrompt(sheet, userMessage);
+        return;
+      }
+      if (isSheetLinkOnly(userMessage, sheet)) {
+        return;
+      }
+    }
+
+    if (sheet && isGoogleConnected()) {
+      const tabs = pendingTabs.length
+        ? pendingTabs
+        : await fetchSheetTabs(sheet.spreadsheetId);
+      if (!sheet.gid && tabs.length > 1) {
+        setInput("");
+        setPendingComposerSheet(sheet);
+        setPendingTabs(tabs);
+        showSheetPickerPrompt(sheet, tabs, userMessage);
+        return;
+      }
+      const gid = sheet.gid ?? tabs[0]?.gid;
+      try {
+        await postLinkedSheet(sheet.spreadsheetId, gid);
+        setLinkedSpreadsheetId(sheet.spreadsheetId);
+        setLinkedGid(gid ?? null);
+        setLinkedTabTitle(tabs.find((tab) => tab.gid === gid)?.title ?? null);
+        setPendingComposerSheet(null);
+        setPendingTabs([]);
+      } catch {
+        // chat can still try with the id on the request body
+      }
+    }
 
     setInput("");
 
@@ -392,6 +930,8 @@ function ChatPage() {
         message: userMessage,
         thread_id: threadId,
         new: isFirstMessage,
+        spreadsheet_id: sheet?.spreadsheetId ?? linkedSpreadsheetId ?? undefined,
+        gid: sheet?.gid ?? linkedGid ?? undefined,
       });
       applyQuotaFromResponse(data);
 
@@ -405,6 +945,8 @@ function ChatPage() {
             new: false,
             latitude: coords.latitude,
             longitude: coords.longitude,
+            spreadsheet_id: linkedSpreadsheetId ?? undefined,
+            gid: linkedGid ?? undefined,
           });
           applyQuotaFromResponse(data);
         } catch (error) {
@@ -511,6 +1053,8 @@ function ChatPage() {
     }
   }
 
+  sendMessageRef.current = sendMessage;
+
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     sendMessage(input);
@@ -520,6 +1064,27 @@ function ChatPage() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage(input);
+    }
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const pasted = e.clipboardData.getData("text");
+    const sheet = parseGoogleSheetLink(pasted);
+    if (!sheet) return;
+
+    if (!isGoogleConnected()) {
+      setPendingComposerSheet(sheet);
+      if (isSheetLinkOnly(pasted, sheet) && !input.trim()) {
+        e.preventDefault();
+        setInput("");
+      }
+      return;
+    }
+
+    if (isSheetLinkOnly(pasted, sheet) && !input.trim()) {
+      e.preventDefault();
+      setInput("");
+      void pickOrSendSheet(sheet, pasted.trim());
     }
   }
 
@@ -609,7 +1174,9 @@ function ChatPage() {
               <div className="chat-empty">
                 <div className="chat-empty-icon">{ASSISTANT_AVATAR}</div>
                 <h2>How can I help you today?</h2>
-                <p>Ask anything — weather, location, or general questions.</p>
+                <p>
+                  Ask anything — or paste a Google Sheet link to connect it.
+                </p>
                 <div className="chat-suggestions">
                   {SUGGESTIONS.map((suggestion) => (
                     <button
@@ -635,7 +1202,39 @@ function ChatPage() {
                       <div className="message-label">
                         {msg.role === "user" ? "You" : ASSISTANT_NAME}
                       </div>
-                      {msg.content}
+                      {msg.kind === "google-connect" && msg.sheet ? (
+                        <GoogleConnectCard
+                          sheet={msg.sheet}
+                          onConnect={() => beginGoogleConnect(msg.sheet!)}
+                        />
+                      ) : msg.kind === "sheet-picker" && msg.sheet && msg.tabs ? (
+                        <SheetPickerCard
+                          tabs={msg.tabs}
+                          selectedGid={linkedGid}
+                          onSelect={(tab) => selectSheetTab(msg.sheet!, tab)}
+                        />
+                      ) : msg.role === "assistant" ? (
+                        <div className="message-markdown">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                              a: ({ href, children }) => (
+                                <a
+                                  href={href}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  {children}
+                                </a>
+                              ),
+                            }}
+                          >
+                            {msg.content}
+                          </ReactMarkdown>
+                        </div>
+                      ) : (
+                        msg.content
+                      )}
                     </div>
                   </article>
                 ))}
@@ -659,37 +1258,101 @@ function ChatPage() {
           <div className="chat-input-area">
             <form onSubmit={handleSubmit}>
               <div className="chat-input-wrap">
-                <textarea
-                  ref={textareaRef}
-                  className="chat-input"
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={
-                    quotaExhausted
-                      ? "Daily token limit reached"
-                      : `Message ${APP_NAME}...`
-                  }
-                  rows={1}
-                  disabled={inputDisabled}
-                />
-                <button
-                  type="submit"
-                  className="chat-send"
-                  disabled={inputDisabled || !input.trim()}
-                  aria-label="Send message"
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                    <path
-                      d="M12 2L12 14M12 2L6 8M12 2L18 8"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      fill="none"
+                {pendingComposerSheet && !googleConnected && (
+                  <GoogleConnectCard
+                    compact
+                    sheet={pendingComposerSheet}
+                    onConnect={() => beginGoogleConnect(pendingComposerSheet)}
+                    onDismiss={() => setPendingComposerSheet(null)}
+                  />
+                )}
+                {pendingComposerSheet &&
+                  googleConnected &&
+                  pendingTabs.length > 1 &&
+                  !pendingComposerSheet.gid && (
+                    <SheetPickerCard
+                      compact
+                      tabs={pendingTabs}
+                      selectedGid={linkedGid}
+                      onSelect={(tab) =>
+                        selectSheetTab(pendingComposerSheet, tab)
+                      }
+                      onDismiss={() => {
+                        setPendingComposerSheet(null);
+                        setPendingTabs([]);
+                      }}
                     />
-                  </svg>
-                </button>
+                  )}
+                {googleConnected && linkedTabTitle && !pendingComposerSheet && (
+                  <div className="sheet-tab-chip-row">
+                    <span className="sheet-tab-chip">
+                      Using <strong>{linkedTabTitle}</strong>
+                    </span>
+                    {linkedSpreadsheetId && (
+                      <button
+                        type="button"
+                        className="sheet-tab-change"
+                        onClick={() => {
+                          void (async () => {
+                            const tabs = await fetchSheetTabs(linkedSpreadsheetId);
+                            if (!tabs.length) return;
+                            const sheet: SheetLink = {
+                              url: sheetUrlWithGid(
+                                linkedSpreadsheetId,
+                                linkedGid || tabs[0].gid,
+                              ),
+                              spreadsheetId: linkedSpreadsheetId,
+                              gid: linkedGid ?? undefined,
+                            };
+                            setPendingComposerSheet(sheet);
+                            setPendingTabs(tabs);
+                            showSheetPickerPrompt(sheet, tabs);
+                          })();
+                        }}
+                      >
+                        Change tab
+                      </button>
+                    )}
+                  </div>
+                )}
+                <div className="chat-input-row">
+                  <textarea
+                    ref={textareaRef}
+                    className="chat-input"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    onPaste={handlePaste}
+                    placeholder={
+                      quotaExhausted
+                        ? "Daily token limit reached"
+                        : pendingComposerSheet && !googleConnected
+                          ? "Add a message, or connect Google to use this sheet…"
+                          : pendingComposerSheet && pendingTabs.length > 1
+                            ? "Pick a tab above, or add a message…"
+                            : `Message ${APP_NAME}...`
+                    }
+                    rows={1}
+                    disabled={inputDisabled}
+                  />
+                  <button
+                    type="submit"
+                    className="chat-send"
+                    disabled={inputDisabled || !input.trim()}
+                    aria-label="Send message"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                      <path
+                        d="M12 2L12 14M12 2L6 8M12 2L18 8"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        fill="none"
+                      />
+                    </svg>
+                  </button>
+                </div>
               </div>
             </form>
             <p

@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 import os
+import re
+import secrets
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from langgraph.checkpoint.postgres import PostgresSaver
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,6 +17,22 @@ from agent import (
     location_required_in_messages,
     pending_tool_call_ids,
     set_request_location,
+)
+from google_auth import (
+    authorization_url,
+    callback_error_html,
+    callback_success_html,
+    creds_expiry,
+    exchange_code,
+    google_configured,
+)
+from google_store import (
+    get_connection,
+    pop_oauth_state,
+    save_oauth_state,
+    setup_google_tables,
+    update_spreadsheet_id,
+    upsert_connection,
 )
 from quota import (
     DEVICE_ID_HEADER,
@@ -29,6 +48,7 @@ from quota import (
     tokens_from_title_result,
     tokens_from_turn_messages,
 )
+from sheets import clear_sheet_context, list_tabs_for_device, set_sheet_context
 from swagger_theme_toggle import add_dark_mode_toggle
 
 load_dotenv()
@@ -58,6 +78,7 @@ async def lifespan(app: FastAPI):
         )
         with quota_pool.connection() as conn:
             setup_quota_table(conn)
+            setup_google_tables(conn)
         try:
             yield
         finally:
@@ -107,6 +128,8 @@ class ChatRequest(BaseModel):
     new: bool = False
     latitude: float | None = None
     longitude: float | None = None
+    spreadsheet_id: str | None = None
+    gid: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -124,6 +147,20 @@ class QuotaExceededDetail(BaseModel):
     tokens_used: int
     tokens_remaining: int
     daily_token_budget: int
+
+
+class GoogleSheetLinkRequest(BaseModel):
+    spreadsheet_id: str
+    gid: str | None = None
+
+
+SHEET_ID_RE = re.compile(r"^[a-zA-Z0-9-_]{20,}$")
+GID_VALUE_RE = re.compile(r"^\d+$")
+SHEET_URL_RE = re.compile(
+    r"https?://docs\.google\.com/spreadsheets/d/(?!e/)([a-zA-Z0-9-_]{20,})",
+    re.I,
+)
+GID_RE = re.compile(r"[?&#]gid=(\d+)")
 
 
 @app.get("/")
@@ -234,6 +271,158 @@ def _record_turn_usage(
     return _quota_response_fields(snapshot)
 
 
+def _parse_sheet_from_text(text: str) -> tuple[str | None, str | None]:
+    match = SHEET_URL_RE.search(text)
+    if not match:
+        return None, None
+    gid_match = GID_RE.search(text)
+    return match.group(1), gid_match.group(1) if gid_match else None
+
+
+def _require_quota_pool() -> ConnectionPool:
+    if quota_pool is None:
+        raise HTTPException(status_code=503, detail="Store unavailable")
+    return quota_pool
+
+
+@app.get("/auth/google/start")
+def google_start(device_id: str, spreadsheet_id: str | None = None):
+    if not google_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth is not configured",
+        )
+    if not is_valid_device_id(device_id):
+        raise HTTPException(status_code=400, detail="Invalid device_id")
+    if spreadsheet_id and not SHEET_ID_RE.fullmatch(spreadsheet_id):
+        raise HTTPException(status_code=400, detail="Invalid spreadsheet_id")
+
+    pool = _require_quota_pool()
+    state = secrets.token_urlsafe(32)
+    auth_url, code_verifier = authorization_url(state)
+    with pool.connection() as conn:
+        save_oauth_state(
+            conn,
+            state=state,
+            device_id=device_id.strip(),
+            spreadsheet_id=spreadsheet_id,
+            code_verifier=code_verifier,
+        )
+    return RedirectResponse(auth_url, status_code=302)
+
+
+@app.get("/auth/google/callback")
+def google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    if error:
+        return HTMLResponse(callback_error_html(error), status_code=400)
+    if not code or not state:
+        return HTMLResponse(
+            callback_error_html("Missing OAuth code. Try connecting again."),
+            status_code=400,
+        )
+
+    pool = _require_quota_pool()
+    with pool.connection() as conn:
+        popped = pop_oauth_state(conn, state)
+        if not popped:
+            return HTMLResponse(
+                callback_error_html("Invalid or expired sign-in. Try again."),
+                status_code=400,
+            )
+        device_id, spreadsheet_id, code_verifier = popped
+        try:
+            creds = exchange_code(code, code_verifier)
+        except Exception as exc:
+            return HTMLResponse(callback_error_html(str(exc)), status_code=400)
+
+        refresh_token = creds.refresh_token
+        if not refresh_token:
+            existing = get_connection(conn, device_id)
+            refresh_token = existing.refresh_token if existing else None
+        if not refresh_token:
+            return HTMLResponse(
+                callback_error_html(
+                    "Google did not return a refresh token. Try connecting again."
+                ),
+                status_code=400,
+            )
+
+        upsert_connection(
+            conn,
+            device_id=device_id,
+            refresh_token=refresh_token,
+            token=creds.token,
+            token_expiry=creds_expiry(creds),
+            spreadsheet_id=spreadsheet_id,
+        )
+
+    return HTMLResponse(callback_success_html(spreadsheet_id=spreadsheet_id))
+
+
+@app.get("/auth/google/status")
+def google_status(request: Request):
+    _, device_id, _ = _resolve_client(request)
+    pool = _require_quota_pool()
+    with pool.connection() as conn:
+        row = get_connection(conn, device_id)
+    return {
+        "connected": row is not None,
+        "spreadsheet_id": row.spreadsheet_id if row else None,
+        "gid": row.gid if row else None,
+    }
+
+
+@app.get("/auth/google/tabs")
+def google_tabs(request: Request, spreadsheet_id: str | None = None):
+    _, device_id, _ = _resolve_client(request)
+    if spreadsheet_id and not SHEET_ID_RE.fullmatch(spreadsheet_id):
+        raise HTTPException(status_code=400, detail="Invalid spreadsheet_id")
+    pool = _require_quota_pool()
+    result = list_tabs_for_device(
+        pool=pool,
+        device_id=device_id,
+        spreadsheet_id=spreadsheet_id,
+    )
+    if result.get("error") == "google_not_connected":
+        raise HTTPException(status_code=401, detail="Google is not connected")
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "Failed to list tabs")
+    return result
+
+
+@app.post("/auth/google/sheet")
+def google_sheet(request: Request, body: GoogleSheetLinkRequest):
+    _, device_id, _ = _resolve_client(request)
+    if not SHEET_ID_RE.fullmatch(body.spreadsheet_id):
+        raise HTTPException(status_code=400, detail="Invalid spreadsheet_id")
+    if body.gid and not GID_VALUE_RE.fullmatch(body.gid):
+        raise HTTPException(status_code=400, detail="Invalid gid")
+
+    pool = _require_quota_pool()
+    with pool.connection() as conn:
+        row = get_connection(conn, device_id)
+        if row is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Google is not connected",
+            )
+        updated = update_spreadsheet_id(
+            conn,
+            device_id=device_id,
+            spreadsheet_id=body.spreadsheet_id,
+            gid=body.gid,
+        )
+    return {
+        "connected": True,
+        "spreadsheet_id": updated.spreadsheet_id if updated else body.spreadsheet_id,
+        "gid": updated.gid if updated else body.gid,
+    }
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: Request, body: ChatRequest):
     ip, device_id, key = _resolve_client(request)
@@ -241,6 +430,32 @@ def chat(request: Request, body: ChatRequest):
 
     config = {"configurable": {"thread_id": body.thread_id}}
     set_request_location(body.latitude, body.longitude)
+
+    parsed_id, parsed_gid = _parse_sheet_from_text(body.message)
+    spreadsheet_id = body.spreadsheet_id or parsed_id
+    pool = _require_quota_pool()
+    with pool.connection() as conn:
+        row = get_connection(conn, device_id)
+        gid = body.gid or parsed_gid
+        if not gid and row and (not spreadsheet_id or spreadsheet_id == row.spreadsheet_id):
+            gid = row.gid
+        if row and spreadsheet_id and (
+            spreadsheet_id != row.spreadsheet_id or gid != row.gid
+        ):
+            update_spreadsheet_id(
+                conn,
+                device_id=device_id,
+                spreadsheet_id=spreadsheet_id,
+                gid=gid,
+            )
+        linked_id = spreadsheet_id or (row.spreadsheet_id if row else None)
+
+    set_sheet_context(
+        device_id=device_id,
+        spreadsheet_id=linked_id,
+        gid=gid,
+        pool=pool,
+    )
 
     message = body.message
     if body.latitude is not None and body.longitude is not None:
@@ -262,6 +477,7 @@ def chat(request: Request, body: ChatRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         clear_request_location()
+        clear_sheet_context()
 
     messages = response["messages"]
     # Only treat as needs_location when we did not already receive coords

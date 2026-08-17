@@ -11,6 +11,11 @@ from pydantic import BaseModel, Field
 
 import httpx
 
+from sheets import append_row as append_row_impl
+from sheets import delete_row as delete_row_impl
+from sheets import read_sheet as read_sheet_impl
+from sheets import update_row as update_row_impl
+
 load_dotenv()
 
 WEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
@@ -226,11 +231,59 @@ def get_location():
     }
 
 
+@tool
+def read_sheet():
+    """Read the linked Google spreadsheet. Returns headers and all data rows.
+
+    Each row includes `_row`, the 1-based Google Sheets row number.
+    Use that number when building an A1 range for updates.
+    If this returns google_not_connected, tell the user to connect Google.
+    """
+    return read_sheet_impl()
+
+
+@tool
+def append_row(values: list[str]):
+    """Append one row to the linked Google spreadsheet.
+
+    Pass cell values in header order, e.g. ["Jane Doe", "jane@example.com", "100"].
+    """
+    return append_row_impl(values)
+
+
+@tool
+def update_row(a1_range: str, values: list[str]):
+    """Update cells in the linked Google spreadsheet using A1 notation.
+
+    Example: a1_range="Sheet1!A4:C4", values=["Yash Jhav", "yash@example.com", "223"].
+    Read the sheet first so the range matches the real row and columns.
+    """
+    return update_row_impl(a1_range, values)
+
+
+@tool
+def delete_row(row_number: int):
+    """Delete one data row from the linked Google spreadsheet.
+
+    row_number is the 1-based Google Sheets row from read_sheet's `_row` field.
+    This removes the row and shifts rows below it up. Never delete row 1 (headers).
+    Read the sheet first so the row number is correct.
+    """
+    return delete_row_impl(row_number)
+
+
 def create_llm_agent(checkpointer):
     model = ChatOpenAI(model="gpt-4o-mini")
     return create_agent(
         model,
-        tools=[get_location, get_weather],
+        tools=[
+            get_location,
+            get_weather,
+            read_sheet,
+            append_row,
+            update_row,
+            delete_row,
+        ],
         debug=False,
         system_prompt=(
             "Give concise responses. "
@@ -239,7 +292,12 @@ def create_llm_agent(checkpointer):
             "Never ask the user to type coordinates. "
             "If get_location returns status=needs_location, stop tool use for "
             "that turn only. On a later turn with coordinates available, call "
-            "get_location again or use the provided coords."
+            "get_location again or use the provided coords. "
+            "When a Google Sheet is linked or the user pastes a Sheets URL, "
+            "use read_sheet / append_row / update_row / delete_row. Never invent "
+            "spreadsheet rows. Read before update or delete. Never delete the "
+            "header row. If a sheet tool returns google_not_connected, tell the "
+            "user to connect with Google."
         ),
         checkpointer=checkpointer,
     )
